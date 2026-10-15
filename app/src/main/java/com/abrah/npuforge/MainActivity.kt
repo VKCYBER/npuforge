@@ -64,6 +64,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.SuggestionChipDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -116,7 +117,6 @@ import kotlin.time.Duration.Companion.milliseconds
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // A killed process cannot run service cleanup; clear its retained Android service record on reopen.
         if (ConvertService.state.value == ConvertService.State.Idle) {
             stopService(Intent(this, ConvertService::class.java))
             getSystemService(NotificationManager::class.java).cancel(ConvertService.NOTE_ID)
@@ -152,6 +152,15 @@ private fun AppScreen() {
     val savedTabs = rememberSaveableStateHolder()
     val focus = LocalFocusManager.current
 
+    val displayedSoc = remember {
+        val model = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else ""
+        when {
+            model.isNotBlank() && model != "unknown" -> model
+            Build.HARDWARE.isNotBlank() && Build.HARDWARE != "unknown" -> Build.HARDWARE
+            else -> "SM7750"
+        }
+    }
+
     BackHandler(enabled = tab != 0) { tab = 0 }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         CenterAlignedTopAppBar(
@@ -165,7 +174,7 @@ private fun AppScreen() {
                     Spacer(Modifier.width(8.dp))
                     SuggestionChip(
                         onClick = {},
-                        label = { Text("NPU: ${Build.SOC_MODEL}", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold) },
+                        label = { Text("NPU: $displayedSoc", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold) },
                         colors = SuggestionChipDefaults.suggestionChipColors(
                             containerColor = MaterialTheme.colorScheme.primaryContainer,
                             labelColor = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -265,34 +274,35 @@ private fun ConvertScreen() {
     var pickedName by rememberSaveable { mutableStateOf("") }
     var editedName by rememberSaveable { mutableStateOf<String?>(null) }
     var report by remember { mutableStateOf<CheckpointInfo.Report?>(null) }
-    // Metadata selects the initial value; the chips remain an explicit override.
     var predictionType by rememberSaveable { mutableStateOf(CheckpointInfo.PredictionType.EPSILON) }
     var predictionTypeOverridden by rememberSaveable { mutableStateOf(false) }
-    // Plain SD1.5 only: convert into an inpainting model by add-difference.
     var asInpaint by rememberSaveable { mutableStateOf(false) }
-    // Plain SD1.5 only: "SD1.5 Swap", LoRA + ControlNet chosen per render (never with asInpaint).
     var asSwap by rememberSaveable { mutableStateOf(false) }
-    // Swap v3: the features this conversion keeps; the rest are left out of the UNet and cost
-    // nothing per render. Kept across checkpoints. Inpaint is off by default: it makes an
-    // inpainting model, so text-to-image wants a second conversion without it.
+
+    // Toggle for skipping VAE Encoder compilation (Default true on SM7750/sub-flagships)
+    val isMidRangeSoC = remember {
+        val model = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else ""
+        model.contains("SM7750", ignoreCase = true) ||
+            Build.HARDWARE.contains("SM7750", ignoreCase = true) ||
+            Build.MODEL.contains("CPH2825", ignoreCase = true)
+    }
+    var skipVaeEncoder by rememberSaveable { mutableStateOf(isMidRangeSoC) }
+
     val swapSupported = remember { Converter.swapFeaturesSupported(context) }
     var swapKeptText by rememberSaveable { mutableStateOf("lora,cn,ip") }
     val swapKept = swapKeptText.split(',').filter { it in swapSupported }
     val swapInpaint = asSwap && "inp" in swapKept
-    // SDXL Swap: offered only when this build carries its template (the 300 MB lib).
+
     val sdxlSwapAvailable = remember {
         runCatching { "recipe.bin" in context.assets.list(CheckpointInfo.Model.SDXL_SWAP.templateDirectory).orEmpty() }
             .getOrDefault(false)
     }
-    // Its own selection, NONE by default: with no feature kept the export is a plain SDXL model that
-    // importers render today; a kept feature needs the generating app's SDXL Swap support.
     val sdxlSwapSupported = remember { Converter.swapFeaturesSupported(context, CheckpointInfo.Model.SDXL_SWAP) }
     var sdxlSwapKeptText by rememberSaveable { mutableStateOf("") }
     val sdxlSwapKept = sdxlSwapKeptText.split(',').filter { it in sdxlSwapSupported }
-    // SDXL Swap with Inpaint kept: add-differenced with the SDXL inpainting difference (5.1 GB).
     val sdxlSwapInpaint = asSwap && report?.model == CheckpointInfo.Model.SDXL && sdxlSwapAvailable &&
         "inp" in sdxlSwapKept
-    // SD1.5 only; kept across checkpoints. 2 is the long-standing default.
+
     var clipSkip by rememberSaveable { mutableStateOf(2) }
     val loras = rememberSaveable(
         saver = listSaver<SnapshotStateList<Triple<Uri, String, Float>>, Any>(
@@ -306,12 +316,10 @@ private fun ConvertScreen() {
     val names = (listOf(pickedName) + loras.map { it.second }).map {
         it.substringBeforeLast(".").take(28).replace(Regex("[^A-Za-z0-9_.-]"), "_").trim('_')
     }
-    // Swap bakes no LoRAs (they are chosen per render), so none go in its name.
     val bakedLoras = if (asSwap) emptyList() else loras
     val modelName = editedName ?: (names.first() + bakedLoras.mapIndexed { i, lora ->
         "+${names[i + 1]}@${lora.third}"
     }.joinToString("")).take(60).let { base ->
-        // Clip skip 1 and inpainting exports of one checkpoint can then sit side by side.
         val suffix = (if (clipSkip == 1 && report?.model != CheckpointInfo.Model.SDXL) "_cs1" else "") +
             (if (asInpaint) "_inpaint" else "") +
             (if (asSwap) "_npuforge_swap" else "") +
@@ -329,7 +337,6 @@ private fun ConvertScreen() {
     }
 
     var inspectError by remember { mutableStateOf<String?>(null) }
-    // Asked only when an SDXL conversion starts without the VAE; SD1.5 users never see it.
     var showVaeDownloadDialog by rememberSaveable { mutableStateOf(false) }
     var pendingConversionModel by remember { mutableStateOf<CheckpointInfo.Model?>(null) }
 
@@ -375,8 +382,6 @@ private fun ConvertScreen() {
         }
     }
     val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
-    // A copy of the inpainting difference downloaded outside the app, for when
-    // huggingface.co and its mirror are both unreachable from the phone.
     val inpaintDiffPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri ->
@@ -388,18 +393,21 @@ private fun ConvertScreen() {
                     context, checkpoint, modelName, model = CheckpointInfo.Model.SDXL_SWAP,
                     inpaintDiffUri = uri, swapFeatures = sdxlSwapKept,
                     predictionType = predictionType.takeIf { predictionTypeOverridden },
+                    skipVaeEncoder = skipVaeEncoder,
                 )
             } else if (swapInpaint) {
                 ConvertService.start(
                     context, checkpoint, modelName, model = CheckpointInfo.Model.SD15_SWAP,
                     inpaintDiffUri = uri, clipSkip = clipSkip, swapFeatures = swapKept,
                     predictionType = predictionType.takeIf { predictionTypeOverridden },
+                    skipVaeEncoder = skipVaeEncoder,
                 )
             } else {
                 ConvertService.start(
                     context, checkpoint, modelName, loras.map { it.first to it.third },
                     model = CheckpointInfo.Model.SD15_INPAINT, inpaintDiff = true, inpaintDiffUri = uri,
                     clipSkip = clipSkip, predictionType = predictionType.takeIf { predictionTypeOverridden },
+                    skipVaeEncoder = skipVaeEncoder,
                 )
             }
         }
@@ -510,8 +518,6 @@ private fun ConvertScreen() {
                     border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)),
                 ) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        // Give both labels the card width; long stages must not
-                        // squeeze the status into a column one character wide.
                         Text(
                             if (s.steps > 0) "${s.step}/${s.steps} · ${s.stage}" else s.stage,
                             modifier = Modifier.fillMaxWidth(),
@@ -519,7 +525,6 @@ private fun ConvertScreen() {
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.primary,
                         )
-                        // ⭐ What is being converted (the user's ask, 2026-10-06).
                         if (s.config.isNotEmpty()) {
                             Text(s.config, style = MaterialTheme.typography.bodyMedium)
                         }
@@ -698,6 +703,43 @@ private fun ConvertScreen() {
                             )
                         }
                     }
+
+                    // VAE Encoder Bypass Toggle (Only applicable for SD1.5 variants)
+                    if (report?.model != CheckpointInfo.Model.SDXL && report?.convertible == true) {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
+                            ),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "Skip VAE Encoder",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(
+                                        "Bypasses encoder graph building. Fixes crash on SD 7 Gen 4; text-to-image remains intact.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Switch(
+                                    checked = skipVaeEncoder,
+                                    onCheckedChange = { skipVaeEncoder = it },
+                                )
+                            }
+                        }
+                    }
+
                     if (report?.model == CheckpointInfo.Model.SD15 && report?.convertible == true) {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(stringResource(R.string.mode_label), style = MaterialTheme.typography.labelMedium)
@@ -812,7 +854,6 @@ private fun ConvertScreen() {
                                         )
                                     }
                                 }
-                                // The inpaint trade-off, shown when Inpaint is ticked (as SD1.5 Swap's note).
                                 if (sdxlSwapInpaint) {
                                     Text(
                                         stringResource(
@@ -856,7 +897,6 @@ private fun ConvertScreen() {
                         modifier = Modifier.fillMaxWidth(),
                     )
 
-                    // Baking LoRAs in is the v1 route; Swap chooses them per render.
                     if (!asSwap) LoraList(loras) { loraPicker.launch("*/*") }
 
                     val inpaintByDiff = asInpaint && report?.model == CheckpointInfo.Model.SD15
@@ -879,6 +919,7 @@ private fun ConvertScreen() {
                                 else -> null
                             },
                             predictionType = predictionType.takeIf { predictionTypeOverridden },
+                            skipVaeEncoder = skipVaeEncoder,
                         )
                     }
 
@@ -887,8 +928,6 @@ private fun ConvertScreen() {
                             val vaeDir = File(context.filesDir, "vae_sdxl")
                             val missing = !File(vaeDir, "vae_decoder.bin").isFile || !File(vaeDir, "vae_encoder.bin").isFile
                             if (sdxlSwapInpaint && !SdxlInpaintDiff.isReady(context)) {
-                                // Asked first: the 5.1 GB difference is the big download (the conversion
-                                // fetches the VAE too if it is missing).
                                 showInpaintDiffDialog = true
                             } else if (report?.model == CheckpointInfo.Model.SDXL && missing) {
                                 pendingConversionModel =
@@ -932,12 +971,14 @@ private fun ConvertScreen() {
                                         context, picked!!, modelName, model = CheckpointInfo.Model.SDXL_SWAP,
                                         swapFeatures = sdxlSwapKept,
                                         predictionType = predictionType.takeIf { predictionTypeOverridden },
+                                        skipVaeEncoder = skipVaeEncoder,
                                     )
                                 } else if (swapInpaint) {
                                     ConvertService.start(
                                         context, picked!!, modelName, model = CheckpointInfo.Model.SD15_SWAP,
                                         clipSkip = clipSkip, swapFeatures = swapKept,
                                         predictionType = predictionType.takeIf { predictionTypeOverridden },
+                                        skipVaeEncoder = skipVaeEncoder,
                                     )
                                 } else {
                                     ConvertService.start(
@@ -945,6 +986,7 @@ private fun ConvertScreen() {
                                         model = CheckpointInfo.Model.SD15_INPAINT, inpaintDiff = true,
                                         clipSkip = clipSkip,
                                         predictionType = predictionType.takeIf { predictionTypeOverridden },
+                                        skipVaeEncoder = skipVaeEncoder,
                                     )
                                 }
                             }) { Text(stringResource(R.string.inpaint_diff_dialog_confirm)) }
@@ -978,8 +1020,6 @@ private fun ConvertScreen() {
                                 val pending = pendingConversionModel
                                 pendingConversionModel = null
                                 if (pending != null) {
-                                    // The pending model, not the report's: an SDXL Swap choice must
-                                    // survive the VAE download prompt.
                                     ConvertService.start(
                                         context, picked!!, modelName,
                                         if (pending == CheckpointInfo.Model.SDXL_SWAP) emptyList()
@@ -987,6 +1027,7 @@ private fun ConvertScreen() {
                                         model = pending,
                                         swapFeatures = if (pending == CheckpointInfo.Model.SDXL_SWAP) sdxlSwapKept else null,
                                         predictionType = predictionType.takeIf { predictionTypeOverridden },
+                                        skipVaeEncoder = skipVaeEncoder,
                                     )
                                 } else {
                                     ConvertService.downloadVae(context)
@@ -1081,7 +1122,6 @@ private fun ConvertScreen() {
     }
 }
 
-/** What the picked checkpoint contains, and what conversion will keep. */
 @Composable
 private fun CheckpointCard(r: CheckpointInfo.Report) {
     Card(
@@ -1187,9 +1227,6 @@ private fun PartRow(label: String, p: CheckpointInfo.Part) {
     }
 }
 
-/**
- * Optional LoRAs, merged into the weights at conversion time.
- */
 @Composable
 private fun LoraList(
     loras: SnapshotStateList<Triple<Uri, String, Float>>,
@@ -1326,7 +1363,6 @@ fun UtilityScreen() {
                         }
                     }
                 }
-                // The picker accepts any file type, so a zip without the VAE is not a success.
                 Toast.makeText(
                     context, if (imported.size == 2) vaeImportedStr else importFailedStr, Toast.LENGTH_SHORT,
                 ).show()
@@ -1494,12 +1530,6 @@ fun UtilityScreen() {
     }
 }
 
-/**
- * Pickers use GET_CONTENT rather than OPEN_DOCUMENT so the system picker also
- * lists file-manager apps (MiXplorer, Material Files, My Files). Their URIs are
- * usually not persistable, which is fine: a conversion copies its inputs as it
- * starts. A persistable grant is still taken when the provider offers one.
- */
 private fun Context.keepReadAccess(uri: Uri) {
     try {
         contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
