@@ -1,38 +1,18 @@
 package com.abrah.npuforge
 
-import android.annotation.SuppressLint
-import android.app.ActivityManager
-import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
 import android.util.Log
 import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStreamReader
-import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
-import java.util.zip.Deflater
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
-import kotlin.time.Duration.Companion.seconds
 
 /**
  * The conversion pipeline: a `.safetensors` in, a model directory out.
- *
- * QNN graphs are populated by [stageWeights], then compiled by [stageCompile].
- * Both model families write checkpoint-owned MNN text encoders via [stageClip].
  */
 object Converter {
 
@@ -55,6 +35,18 @@ object Converter {
     private val UNOFFERED = mapOf(
         CheckpointInfo.Model.SDXL_SWAP to setOf("inp", "conv", "freeu", "pag", "couple"),
     )
+
+    fun socTier(): String {
+        val hardware = Build.HARDWARE.lowercase()
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL.lowercase() else ""
+        return when {
+            soc.contains("sm8650") || hardware.contains("sm8650") -> "8gen3"
+            soc.contains("sm8550") || hardware.contains("sm8550") -> "8gen2"
+            soc.contains("sm8450") || hardware.contains("sm8450") || soc.contains("sm8475") -> "8gen1"
+            soc.contains("sm7750") || hardware.contains("sm7750") -> "7gen4"
+            else -> "generic"
+        }
+    }
 
     fun sdxlSwapTemplate(context: Context): Pair<String, Int> = runCatching {
         val text = context.assets.open("${CheckpointInfo.Model.SDXL_SWAP.templateDirectory}/$SWAP_FEATURES_MARKER")
@@ -121,41 +113,29 @@ object Converter {
             "\"features\":[" + features.joinToString(",") { "\"$it\"" } + "]}"
     }
 
-    /**
-     * Resolves target HTP hardware parameters tailored for Snapdragon processors.
-     * Prevents MODEL_GRAPH_ERROR (exit code 14) on 7-series SoCs by clamping VTCM to 4 MB
-     * and setting soc_model to 0 (dynamic runtime binding).
-     */
-    fun resolveHtpHardwareConfig(socName: String): Triple<String, Int, Int> {
-        val soc = socName.uppercase()
+    fun resolveHtpHardwareConfig(): Triple<String, Int, Int> {
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL.uppercase() else ""
         val hardware = Build.HARDWARE.uppercase()
         val model = Build.MODEL.uppercase()
 
         return when {
-            // Snapdragon 7 Gen 4 (SM7750) & related series
             soc.contains("SM7750") || hardware.contains("SM7750") || model.contains("CPH2825") -> {
                 Triple("v73", 0, 4)
             }
-            // Snapdragon 8 Gen 3 (SM8650)
             soc.contains("SM8650") || hardware.contains("SM8650") -> {
                 Triple("v75", 57, 8)
             }
-            // Snapdragon 8 Gen 2 (SM8550)
             soc.contains("SM8550") || hardware.contains("SM8550") -> {
                 Triple("v73", 43, 8)
             }
-            // Fallback for general Snapdragon devices: 4 MB VTCM, auto soc_model
             else -> {
                 Triple("v73", 0, 4)
             }
         }
     }
 
-    /**
-     * Generates the backend JSON configuration for libqnncontextgen.so.
-     */
-    fun buildHtpConfigJson(socName: String, graphName: String = "model"): String {
-        val (dspArch, socModel, vtcmMb) = resolveHtpHardwareConfig(socName)
+    fun buildHtpConfigJson(graphName: String = "model"): String {
+        val (dspArch, socModel, vtcmMb) = resolveHtpHardwareConfig()
         return """
         {
           "graphs": [
@@ -183,19 +163,161 @@ object Converter {
         """.trimIndent()
     }
 
-    /** Copies checkpoint or LoRA data into this conversion's work directory. */
-    suspend fun importFile(context: Context, uri: Uri, dst: File) = withContext(Dispatchers.IO) {
+    suspend fun importFile(
+        context: Context,
+        uri: Uri,
+        dst: File,
+        onProgress: ((Long) -> Unit)? = null,
+    ): File = withContext(Dispatchers.IO) {
         context.contentResolver.openInputStream(uri)?.use { input ->
             FileOutputStream(dst).use { output ->
-                input.copyTo(output)
+                val buffer = ByteArray(65536)
+                var copied = 0L
+                var read: Int
+                while (input.read(buffer).also { read = it } >= 0) {
+                    output.write(buffer, 0, read)
+                    copied += read
+                    onProgress?.invoke(copied)
+                }
             }
         } ?: throw Failure("Could not open input URI: $uri")
+        dst
     }
 
-    /**
-     * Executes native helper binaries placed in the native library directory.
-     */
-    suspend fun runNativeCommand(
+    suspend fun stageDspLibs(context: Context, destination: File) = withContext(Dispatchers.IO) {
+        destination.mkdirs()
+        runCatching {
+            context.assets.list("qnnlibs")?.forEach { libName ->
+                context.assets.open("qnnlibs/$libName").use { input ->
+                    File(destination, libName).outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun stageClip(
+        context: Context,
+        ckpt: File,
+        workDir: File,
+        componentFiles: File,
+        model: CheckpointInfo.Model,
+        diagnostic: ConversionReport,
+        clipDirectory: String,
+        onLog: (String) -> Unit
+    ) = withContext(Dispatchers.IO) {
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val clipDir = File(workDir, "clip").apply { mkdirs() }
+        val exit = runNativeCommand(
+            command = listOf(
+                "$nativeDir/libcomponentconv.so",
+                clipDir.absolutePath,
+                ckpt.absolutePath,
+                componentFiles.absolutePath
+            ),
+            cwd = workDir,
+            env = emptyMap(),
+            onLog = onLog
+        )
+        if (exit != 0) throw Failure("libcomponentconv.so failed (rc $exit)")
+    }
+
+    suspend fun stageWeights(
+        context: Context,
+        ckpt: File,
+        workDir: File,
+        model: CheckpointInfo.Model,
+        diagnostic: ConversionReport,
+        loraFiles: List<Pair<File, Float>> = emptyList(),
+        templateDirectory: String = model.templateDirectory,
+        extraArgs: List<String> = emptyList(),
+        onLog: (String) -> Unit
+    ): File = withContext(Dispatchers.IO) {
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val outPack = File(workDir, "out.pack")
+        val recipe = File(workDir, "recipe.bin")
+        val tplTrim = File(workDir, "tpl_trim.pack")
+
+        val command = mutableListOf(
+            "$nativeDir/libtplconv.so",
+            recipe.absolutePath,
+            tplTrim.absolutePath,
+            ckpt.absolutePath,
+            outPack.absolutePath
+        ).apply { addAll(extraArgs) }
+
+        val exit = runNativeCommand(
+            command = command,
+            cwd = workDir,
+            env = emptyMap(),
+            onLog = onLog
+        )
+        if (exit != 0) throw Failure("libtplconv.so failed (rc $exit)")
+        outPack
+    }
+
+    suspend fun stageCompile(
+        context: Context,
+        pack: File,
+        workDir: File,
+        model: CheckpointInfo.Model,
+        diagnostic: ConversionReport,
+        component: String = "unet",
+        tplDrop: String = "",
+        onLog: (String) -> Unit
+    ): File = withContext(Dispatchers.IO) {
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val qnnLibsDir = File(context.filesDir, "qnnlibs").absolutePath
+        val htpConfig = File(workDir, "htp_backend.json").apply {
+            writeText(buildHtpConfigJson("model"))
+        }
+
+        val outDir = File(workDir, "out").apply { mkdirs() }
+        val env = mutableMapOf(
+            "LD_LIBRARY_PATH" to "$nativeDir:/system/lib64:/vendor/lib64:/vendor/lib64/egl",
+            "ADSP_LIBRARY_PATH" to "$qnnLibsDir;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp",
+            "QNN_TPL_PACK" to pack.absolutePath
+        )
+        if (tplDrop.isNotEmpty()) {
+            env["QNN_TPL_DROP"] = tplDrop
+        }
+
+        val exit = runNativeCommand(
+            command = listOf(
+                "$nativeDir/libqnncontextgen.so",
+                "--model", File(workDir, "template/libqnn_model.so").absolutePath,
+                "--backend", "$nativeDir/libQnnHtp.so",
+                "--output_dir", outDir.absolutePath,
+                "--binary_file", component,
+                "--config_file", htpConfig.absolutePath,
+                "--log_level", "info"
+            ),
+            cwd = workDir,
+            env = env,
+            onLog = onLog
+        )
+        if (exit != 0) throw Failure("libqnncontextgen.so failed (rc $exit)")
+        File(outDir, "$component.bin")
+    }
+
+    suspend fun assemble(
+        context: Context,
+        unet: File,
+        name: String,
+        model: CheckpointInfo.Model,
+        componentFiles: File,
+        swapFeatures: Collection<String>? = null,
+        predictionType: CheckpointInfo.PredictionType = CheckpointInfo.PredictionType.EPSILON,
+        onProgress: (String) -> Unit
+    ): String = withContext(Dispatchers.IO) {
+        onProgress("Assembling model archive…")
+        val exportDir = File(context.filesDir, OUTPUT_SUBDIR).apply { mkdirs() }
+        val finalZip = File(exportDir, "$name.zip")
+        finalZip.absolutePath
+    }
+
+    private suspend fun runNativeCommand(
         command: List<String>,
         cwd: File,
         env: Map<String, String>,
@@ -204,12 +326,10 @@ object Converter {
         val processBuilder = ProcessBuilder(command)
             .directory(cwd)
             .redirectErrorStream(true)
-
         processBuilder.environment().putAll(env)
 
         val process = processBuilder.start()
         val reader = BufferedReader(InputStreamReader(process.inputStream))
-
         try {
             var line: String?
             while (reader.readLine().also { line = it } != null) {
@@ -219,106 +339,6 @@ object Converter {
         } finally {
             reader.close()
             process.destroy()
-        }
-    }
-
-    /**
-     * Executes the conversion pipeline.
-     */
-    suspend fun convert(
-        context: Context,
-        checkpointUri: Uri,
-        modelInfo: CheckpointInfo.Model,
-        predictionType: CheckpointInfo.PredictionType,
-        socName: String,
-        skipVaeEncoder: Boolean = true,
-        onProgress: (String) -> Unit
-    ) = withContext(Dispatchers.Default) {
-        val workDir = File(context.noBackupFilesDir, "conversion-work").apply {
-            deleteRecursively()
-            mkdirs()
-        }
-
-        try {
-            val ckptFile = File(workDir, "ckpt.safetensors")
-            onProgress("Importing checkpoint…")
-            importFile(context, checkpointUri, ckptFile)
-
-            val nativeDir = context.applicationInfo.nativeLibraryDir
-            val qnnLibsDir = File(context.filesDir, "qnnlibs").absolutePath
-
-            val baseEnv = mapOf(
-                "LD_LIBRARY_PATH" to "$nativeDir:/system/lib64:/vendor/lib64:/vendor/lib64/egl",
-                "ADSP_LIBRARY_PATH" to "$qnnLibsDir;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp"
-            )
-
-            // Stage 1: Text Encoders (CLIP)
-            onProgress("Converting text encoders…")
-            val clipDir = File(workDir, "clip").apply { mkdirs() }
-            val clipExit = runNativeCommand(
-                command = listOf(
-                    "$nativeDir/libcomponentconv.so",
-                    clipDir.absolutePath,
-                    ckptFile.absolutePath,
-                    File(workDir, "components").apply { mkdirs() }.absolutePath
-                ),
-                cwd = workDir,
-                env = emptyMap(),
-                onLog = { Log.d(TAG, it) }
-            )
-            if (clipExit != 0) throw Failure("CLIP conversion failed (rc $clipExit)")
-
-            // Stage 2: VAE Encoder (Optional: bypassed by default for Text-to-Image models)
-            if (!skipVaeEncoder) {
-                onProgress("Preparing image encoder weights…")
-                val vaeDir = File(workDir, "vae_encoder").apply { mkdirs() }
-                val outPack = File(vaeDir, "out.pack")
-                
-                val tplExit = runNativeCommand(
-                    command = listOf(
-                        "$nativeDir/libtplconv.so",
-                        File(vaeDir, "template/recipe.bin").absolutePath,
-                        File(vaeDir, "template/tpl_trim.pack").absolutePath,
-                        ckptFile.absolutePath,
-                        outPack.absolutePath
-                    ),
-                    cwd = vaeDir,
-                    env = emptyMap(),
-                    onLog = { Log.d(TAG, it) }
-                )
-                if (tplExit != 0) throw Failure("libtplconv.so failed (rc $tplExit)")
-
-                onProgress("Building the image encoder…")
-                val htpConfigFile = File(vaeDir, "htp_backend.json").apply {
-                    writeText(buildHtpConfigJson(socName, "model"))
-                }
-
-                val compileEnv = baseEnv.toMutableMap().apply {
-                    put("QNN_TPL_PACK", outPack.absolutePath)
-                }
-
-                val qnnExit = runNativeCommand(
-                    command = listOf(
-                        "$nativeDir/libqnncontextgen.so",
-                        "--model", File(vaeDir, "template/libqnn_model.so").absolutePath,
-                        "--backend", "$nativeDir/libQnnHtp.so",
-                        "--output_dir", File(vaeDir, "out").apply { mkdirs() }.absolutePath,
-                        "--binary_file", "vae_encoder",
-                        "--config_file", htpConfigFile.absolutePath,
-                        "--log_level", "info"
-                    ),
-                    cwd = vaeDir,
-                    env = compileEnv,
-                    onLog = { Log.d(TAG, it) }
-                )
-                if (qnnExit != 0) throw Failure("libqnncontextgen.so failed (rc $qnnExit)")
-            } else {
-                Log.i(TAG, "Skipping VAE Encoder compilation (not required for Text-to-Image generation)")
-            }
-
-            onProgress("Conversion finished successfully")
-        } finally {
-            workDir.deleteRecursively()
         }
     }
 }
