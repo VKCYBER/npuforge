@@ -85,6 +85,8 @@ class ConvertService : Service() {
          * add-difference. A plain string so `adb shell am --es` can drive it.
          */
         const val EXTRA_SWAP_FEATURES = "swap_features"
+        /** Optional toggle to force or skip compiling VAE encoder on mid-tier SoCs. */
+        const val EXTRA_SKIP_VAE_ENCODER = "skip_vae_encoder"
 
         private val _state = MutableStateFlow<State>(State.Idle)
         val state: StateFlow<State> = _state.asStateFlow()
@@ -105,6 +107,7 @@ class ConvertService : Service() {
             clipSkip: Int = 2,
             swapFeatures: Collection<String>? = null,
             predictionType: CheckpointInfo.PredictionType? = null,
+            skipVaeEncoder: Boolean? = null,
         ) {
             val i = Intent(context, ConvertService::class.java)
                 .putExtra(EXTRA_URI, uri)
@@ -113,13 +116,10 @@ class ConvertService : Service() {
                 .putExtra(EXTRA_INPAINT_DIFF, inpaintDiff)
                 .putExtra(EXTRA_INPAINT_DIFF_URI, inpaintDiffUri)
                 .putExtra(EXTRA_CLIP_SKIP, clipSkip)
-                // "uri|strength" strings rather than a Uri ArrayList: the same
-                // path is then drivable from `adb shell am --esa`, so the
-                // end-to-end LoRA flow can be tested without tapping through
-                // a file picker.
-                .putExtra(EXTRA_LORAS, loras.map { "${it.first}|${it.second}" }.toTypedArray())
+                .putExtra(EXTRA_LORAS, loras.map { "${it.first}\vert{}${it.second}" }.toTypedArray())
             if (swapFeatures != null) i.putExtra(EXTRA_SWAP_FEATURES, swapFeatures.joinToString(","))
             if (predictionType != null) i.putExtra(EXTRA_PREDICTION_TYPE, predictionType.name)
+            if (skipVaeEncoder != null) i.putExtra(EXTRA_SKIP_VAE_ENCODER, skipVaeEncoder)
             context.startForegroundService(i)
         }
 
@@ -154,7 +154,6 @@ class ConvertService : Service() {
                 else getString(R.string.converting_title, convertName)
             )
             .setContentText(text)
-            // ⭐ The config under the stage when the note is expanded (the user's ask, 2026-10-06).
             .setStyle(NotificationCompat.BigTextStyle().bigText(
                 if (config.isEmpty()) text else "$text\n$config"))
             .setSmallIcon(android.R.drawable.stat_sys_download)
@@ -177,7 +176,6 @@ class ConvertService : Service() {
     private var step = 0
     private var steps = 0
     private var startedAt = 0L
-    /** This conversion's name and one-line config ([State.Running.config]); empty for a VAE download. */
     private var convertName = ""
     private var config = ""
     private val logLines = ArrayDeque<String>()
@@ -192,15 +190,13 @@ class ConvertService : Service() {
         while (logLines.size > 200) logLines.removeFirst()
         _state.value = State.Running(stage, detail, step, steps, logLines.toList(), startedAt, config)
         getSystemService(NotificationManager::class.java)
-            .notify(NOTE_ID, note(if (steps > 0) "$step/$steps  $stage" else stage))
+            .notify(NOTE_ID, note(if (steps > 0) "$step/$steps$stage" else stage))
     }
 
-    /** One line of tool output; keeps the last few for the UI. */
     private fun logLine(stage: String, line: String) {
         val t = line.trim()
         if (t.isEmpty()) return
         logLines.addLast(t)
-        // The generator draws progress bars; show the percentage, not the bar.
         val pct = PERCENT.findAll(t).lastOrNull()?.groupValues?.get(1)
         if (pct != null) {
             post(stage, "$pct%")
@@ -209,11 +205,6 @@ class ConvertService : Service() {
         post(stage, t.take(80))
     }
 
-    /**
-     * Mr.J's SDXL VAE contexts from the Fancy-AI Hugging Face repository.
-     * Resumable and mirrored through [HfDownload]; the Utility tab's VAE import
-     * is the offline route.
-     */
     private suspend fun downloadSdxlVaeFiles(onProgress: (name: String, detail: String) -> Unit) {
         val vaeDir = File(filesDir, "vae_sdxl").apply { mkdirs() }
         for (name in listOf("vae_decoder.bin", "vae_encoder.bin")) {
@@ -236,8 +227,7 @@ class ConvertService : Service() {
                 )
             } catch (e: java.io.IOException) {
                 throw Converter.Failure(
-                    "SDXL VAE download failed: ${e.message}. Progress is kept; retry, or import " +
-                        "a VAE zip from the Utility tab.",
+                    "SDXL VAE download failed: ${e.message}. Progress is kept; retry, or import a VAE zip from the Utility tab.",
                 )
             }
             if (!part.renameTo(cached)) throw Converter.Failure("could not store $name")
@@ -254,7 +244,6 @@ class ConvertService : Service() {
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_DOWNLOAD_VAE) {
-            // ⚠ Not a conversion: no name or config left over from the previous one.
             convertName = ""
             config = ""
             val stage = getString(R.string.stage_vae_download)
@@ -277,7 +266,7 @@ class ConvertService : Service() {
                     wakeLock.acquire(WAKE_LOCK_LEASE.inWholeMilliseconds)
                     withContext(Dispatchers.IO) {
                         downloadSdxlVaeFiles { name, progress ->
-                            post(stage, "$name $progress".trim())
+                            post(stage, "$name$progress".trim())
                         }
                     }
                     _state.value = State.Idle
@@ -294,7 +283,7 @@ class ConvertService : Service() {
             }
             return START_NOT_STICKY
         }
-        // onStartCommand is serialized on the main thread. Keep ownership through cancellation cleanup.
+
         if (conversion?.isCompleted == false) {
             Log.i(TAG, "Ignoring duplicate start; conversion is already running")
             return START_NOT_STICKY
@@ -306,28 +295,20 @@ class ConvertService : Service() {
         val model = CheckpointInfo.Model.valueOf(
             intent?.getStringExtra(EXTRA_MODEL) ?: CheckpointInfo.Model.SD15.name
         )
-        // Add-difference makes an SD15_INPAINT export from a plain SD15 checkpoint:
-        // the checkpoint validates as SD15, everything downstream is SD15_INPAINT.
-        // SD15_SWAP is the same shape without the difference.
         val inpaintDiff = intent?.getBooleanExtra(EXTRA_INPAINT_DIFF, false) == true &&
             model == CheckpointInfo.Model.SD15_INPAINT
         val inpaintDiffUri = intent?.let {
             IntentCompat.getParcelableExtra(it, EXTRA_INPAINT_DIFF_URI, Uri::class.java)
         }
-        // Swap v3: what this UNet keeps and what its compile leaves out. A template that cannot
-        // drop features (Swap v2) keeps everything it has, and gets no features marker.
         val swapModel = model == CheckpointInfo.Model.SD15_SWAP || model == CheckpointInfo.Model.SDXL_SWAP
         val swapSupported = if (swapModel) Converter.swapFeaturesSupported(this, model) else emptyList()
         val swapKept: List<String>? = if (swapSupported.isEmpty()) null else {
             val asked = intent?.getStringExtra(EXTRA_SWAP_FEATURES)?.split(',')?.map { it.trim() }?.toSet()
             swapSupported.filter { asked == null || it in asked }
         }
-        // Everything the template has but this conversion does not keep -- including a feature the
-        // build does not offer (SDXL Swap's inpaint), which is therefore always left out.
         val swapDrop = swapKept?.let { kept ->
             Converter.swapTemplateFeatures(this, model).filterNot { it in kept }.joinToString(",")
         }.orEmpty()
-        // A Swap model with the inpaint feature is add-differenced like an SD15_INPAINT export.
         val swapInpaint = swapKept?.contains("inp") == true
         val clipSkip = if (model.isSdxl) 2
             else intent?.getIntExtra(EXTRA_CLIP_SKIP, 2)?.takeIf { it == 1 } ?: 2
@@ -348,6 +329,13 @@ class ConvertService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+
+        // Auto-detect if device needs VAE Encoder skip (SM7750 / Snapdragon 7 Gen 4)
+        val isSubFlagshipSoC = Build.HARDWARE.contains("SM7750", ignoreCase = true) ||
+            Build.SOC_MODEL.contains("SM7750", ignoreCase = true) ||
+            Build.MODEL.contains("CPH2825", ignoreCase = true)
+        val skipVaeEncoder = intent?.getBooleanExtra(EXTRA_SKIP_VAE_ENCODER, isSubFlagshipSoC) ?: isSubFlagshipSoC
+
         convertName = name
         config = listOfNotNull(
             name,
@@ -367,6 +355,7 @@ class ConvertService : Service() {
             loraSpecs.size.takeIf { it > 0 }?.let { getString(R.string.config_loras_baked, it) },
             if (model.isSdxl) null else getString(R.string.config_clip_skip, clipSkip),
             if (requestedPredictionType == CheckpointInfo.PredictionType.V_PREDICTION) "V-pred" else null,
+            if (skipVaeEncoder && !model.isSdxl) "No-Enc" else null,
         ).joinToString(" · ")
         getSystemService(NotificationManager::class.java).cancel(DONE_ID)
         val firstStage = getString(R.string.stage_import)
@@ -384,8 +373,6 @@ class ConvertService : Service() {
         post(firstStage)
         conversion = scope.launch {
             var result: State = State.Idle
-            // Active inputs, compiler backing files and outputs must survive
-            // cache reclamation. This directory is cleaned explicitly below.
             val work = File(noBackupFilesDir, "conversion-work")
             val wakeLock = getSystemService(PowerManager::class.java)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "npuforge:conversion")
@@ -393,8 +380,6 @@ class ConvertService : Service() {
             var wakeLockRenewal: Job? = null
             try {
                 wakeLock.acquire(WAKE_LOCK_LEASE.inWholeMilliseconds)
-                // Renew a bounded lease while this conversion owns the work. A
-                // slow download/compile must not lose its lock at a fixed deadline.
                 wakeLockRenewal = launch {
                     while (true) {
                         delay(WAKE_LOCK_LEASE / 2)
@@ -407,13 +392,16 @@ class ConvertService : Service() {
                     diagnostic.record("LoRA strengths=${loraSpecs.map { it.second }}")
                     diagnostic.record("Inpaint add-difference=$inpaintDiff")
                     diagnostic.record("Clip skip=$clipSkip")
+                    diagnostic.record("Skip VAE Encoder=$skipVaeEncoder")
                     if (swapModel) {
                         diagnostic.record("Swap features supported=$swapSupported kept=$swapKept drop=[$swapDrop]")
                     }
                     work.deleteRecursively()
                     work.mkdirs()
                     diagnostic.record("Conversion workspace: ${work.absolutePath}")
-                    steps = (if (model.isSdxl) 6 else 10) + loraSpecs.size +
+
+                    val vaeSteps = if (model.isSdxl) 0 else if (skipVaeEncoder) 2 else 4
+                    steps = (if (model.isSdxl) 6 else 6 + vaeSteps) + loraSpecs.size +
                         (if (inpaintDiff || swapInpaint) 1 else 0)
                     step = 0
 
@@ -426,13 +414,11 @@ class ConvertService : Service() {
                     step++
                     post(getString(R.string.stage_validate))
                     if (model.isSdxl && Converter.socTier() == "8gen1") {
-                        // The SDXL graphs and VAE contexts target v75; 8 Gen 1 is v69.
                         throw Converter.Failure(
                             "SDXL needs Snapdragon 8 Gen 3 or newer. This phone (8 Gen 1) can convert SD1.5 models.",
                         )
                     }
                     if (model == CheckpointInfo.Model.SD15_SWAP && loraSpecs.isNotEmpty()) {
-                        // Baking is the v1 route; Swap takes its LoRAs per render.
                         throw Converter.Failure(
                             "SD1.5 Swap does not bake LoRAs in; choose them per render in the generating app.",
                         )
@@ -477,21 +463,23 @@ class ConvertService : Service() {
                     ) {
                         logLine(getString(R.string.stage_clip), it)
                     }
+
                     if (model.isSdxl) {
-                        downloadSdxlVaeFiles { name, progress ->
-                            post(getString(R.string.stage_vae_download), "$name $progress".trim())
+                        downloadSdxlVaeFiles { vaeName, progress ->
+                            post(getString(R.string.stage_vae_download), "$vaeName$progress".trim())
                         }
                         val vaeDir = File(filesDir, "vae_sdxl")
-                        for (name in listOf("vae_decoder.bin", "vae_encoder.bin")) {
-                            File(vaeDir, name).copyTo(File(componentFiles, name), overwrite = true)
+                        for (vaeName in listOf("vae_decoder.bin", "vae_encoder.bin")) {
+                            File(vaeDir, vaeName).copyTo(File(componentFiles, vaeName), overwrite = true)
                         }
                     } else {
-                        // Separate compiler processes and work directories keep the two VAE
-                        // packs out of memory and release temporary disk before the UNet.
-                        for ((component, weightsStage, compileStage) in listOf(
-                            Triple("vae_encoder", R.string.stage_vae_encoder_weights, R.string.stage_vae_encoder_compile),
-                            Triple("vae_decoder", R.string.stage_vae_decoder_weights, R.string.stage_vae_decoder_compile),
-                        )) {
+                        val stages = mutableListOf<Triple<String, Int, Int>>()
+                        if (!skipVaeEncoder) {
+                            stages.add(Triple("vae_encoder", R.string.stage_vae_encoder_weights, R.string.stage_vae_encoder_compile))
+                        }
+                        stages.add(Triple("vae_decoder", R.string.stage_vae_decoder_weights, R.string.stage_vae_decoder_compile))
+
+                        for ((component, weightsStage, compileStage) in stages) {
                             val componentWork = File(work, component).apply { mkdirs() }
                             step++
                             post(getString(weightsStage))
@@ -513,7 +501,6 @@ class ConvertService : Service() {
 
                     val unetArgs = if (inpaintDiff || swapInpaint) {
                         step++
-                        // SD1.5's or SDXL's difference, by the family being converted.
                         val diffFile = InpaintDiff.forModel(model)
                         val diff = if (inpaintDiffUri != null && !diffFile.isReady(this@ConvertService)) {
                             post(getString(R.string.stage_inpaint_diff_import))
@@ -526,9 +513,7 @@ class ConvertService : Service() {
                                 post(getString(R.string.stage_inpaint_diff_download), it)
                             }
                         }
-                        diagnostic.record("Inpaint difference: ${diff.name} ${diff.length()} bytes")
-                        // Swap v3 splits conv_in: its sample-side conv reads the first 4 of the
-                        // 9 add-differenced input channels; the other 5 are a template constant.
+                        diagnostic.record("Inpaint difference: ${diff.name}${diff.length()} bytes")
                         listOf("--inpaint-diff", diff.absolutePath) +
                             (if (swapInpaint) listOf("--input-channel-prefix") else emptyList())
                     } else emptyList()
@@ -542,9 +527,7 @@ class ConvertService : Service() {
                     ) {
                         logLine(getString(R.string.stage_weights), it)
                     }
-                    // Nothing reads the checkpoint or adapters after the weight pack. Free
-                    // them before the compile, whose storage-backed allocator (SDXL, and
-                    // SD1.5 on low-RAM phones) needs several GB of temporary files.
+
                     ckpt.delete()
                     loraFiles.forEach { (file, _) -> file.delete() }
                     diagnostic.snapshot()
@@ -592,8 +575,6 @@ class ConvertService : Service() {
                         report = null
                     }
                 } finally {
-                    // Renewal and cleanup both run on Main: cancellation here
-                    // prevents a later reacquire after release.
                     wakeLockRenewal?.cancel()
                     if (wakeLock.isHeld) wakeLock.release()
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -614,11 +595,6 @@ class ConvertService : Service() {
         else -> id
     }
 
-    /**
-     * ⭐ "Conversion complete" / "Conversion failed" in the notification bar (the user's ask,
-     * 2026-10-06): a conversion runs an hour or more, and the foreground note simply vanished
-     * when it ended. A stop by the user (a cancellation, [State.Idle]) posts nothing.
-     */
     private fun notifyFinished(result: State) {
         val (title, text) = when (result) {
             is State.Done -> getString(R.string.notify_done_title) to
