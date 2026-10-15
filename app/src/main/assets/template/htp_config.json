@@ -1,7 +1,7 @@
 {
   "graphs": [
     {
-      "vtcm_mb": 8,
+      "vtcm_mb": 4,
       "graph_names": [
         "model"
       ],
@@ -10,7 +10,7 @@
   ],
   "devices": [
     {
-      "dsp_arch": "68",
+      "dsp_arch": "v73",
       "soc_model": 0,
       "cores": [
         {
