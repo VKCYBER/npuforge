@@ -10,8 +10,8 @@
   ],
   "devices": [
     {
-      "dsp_arch": "v73",
-      "soc_model": 43,
+      "dsp_arch": "68",
+      "soc_model": 0,
       "cores": [
         {
           "perf_profile": "burst",
