@@ -9,16 +9,18 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
-import android.os.IBinder
 import android.os.Build
+import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.IntentCompat
 import androidx.core.net.toUri
-import kotlinx.coroutines.CoroutineScope
+import java.io.File
+import kotlin.time.Duration.Companion.minutes
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -31,8 +33,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
-import kotlin.time.Duration.Companion.minutes
 
 /**
  * Owns one conversion and its foreground notification until native work and cleanup finish.
@@ -48,7 +48,6 @@ class ConvertService : Service() {
             val steps: Int = 0,
             val log: List<String> = emptyList(),
             val startedAt: Long = 0,
-            /** What is being converted, one line: `name · SDXL Swap · LoRA · V-pred`. */
             val config: String = "",
         ) : State
         data class Done(val dir: String, val seconds: Long, val log: String = "", val config: String = "") : State
@@ -59,31 +58,20 @@ class ConvertService : Service() {
         private const val TAG = "ConvertService"
         private const val CHANNEL = "convert"
         internal const val NOTE_ID = 1
-        /** The finished/failed notice: its own id, so it outlives the foreground note. */
         private const val DONE_ID = 2
-        /** Default importance, unlike [CHANNEL]: a finish after an hour must actually be seen. */
         private const val CHANNEL_DONE = "convert_done"
         private const val ACTION_STOP = "com.abrah.npuforge.STOP_CONVERSION"
         const val ACTION_DOWNLOAD_VAE = "com.abrah.npuforge.DOWNLOAD_VAE"
         private val WAKE_LOCK_LEASE = 10.minutes
-        private val PERCENT = Regex("""(\d{1,3})%""")
+        private val PERCENT = Regex("(\\d{1,3})%")
         const val EXTRA_URI = "uri"
         const val EXTRA_NAME = "name"
         const val EXTRA_LORAS = "loras"
         const val EXTRA_MODEL = "model"
-        /** Plain 4-channel SD1.5 checkpoint -> inpainting model by add-difference ([InpaintDiff]). */
         const val EXTRA_INPAINT_DIFF = "inpaint_diff"
-        /** A user-downloaded copy of the inpainting difference, imported instead of downloading. */
         const val EXTRA_INPAINT_DIFF_URI = "inpaint_diff_uri"
-        /** SD1.5 text-encoder clip skip, 1 or 2 ([CheckpointInfo.clipDirectory]). */
         const val EXTRA_CLIP_SKIP = "clip_skip"
-        /** Explicit UI/automation override; absent means use trusted checkpoint metadata. */
         const val EXTRA_PREDICTION_TYPE = "prediction_type"
-        /**
-         * SD1.5 Swap v3: the features to KEEP, comma-separated ([Converter.SWAP_FEATURES]);
-         * absent = every feature the template supports. "inp" makes an inpainting model by
-         * add-difference. A plain string so `adb shell am --es` can drive it.
-         */
         const val EXTRA_SWAP_FEATURES = "swap_features"
         const val EXTRA_SKIP_VAE_ENCODER = "skip_vae_encoder"
 
@@ -115,7 +103,7 @@ class ConvertService : Service() {
                 .putExtra(EXTRA_INPAINT_DIFF, inpaintDiff)
                 .putExtra(EXTRA_INPAINT_DIFF_URI, inpaintDiffUri)
                 .putExtra(EXTRA_CLIP_SKIP, clipSkip)
-                .putExtra(EXTRA_LORAS, loras.map { "${it.first}\vert{}${it.second}" }.toTypedArray())
+                .putExtra(EXTRA_LORAS, loras.map { "${it.first}|${it.second}" }.toTypedArray())
             if (swapFeatures != null) i.putExtra(EXTRA_SWAP_FEATURES, swapFeatures.joinToString(","))
             if (predictionType != null) i.putExtra(EXTRA_PREDICTION_TYPE, predictionType.name)
             if (skipVaeEncoder != null) i.putExtra(EXTRA_SKIP_VAE_ENCODER, skipVaeEncoder)
@@ -137,43 +125,49 @@ class ConvertService : Service() {
         super.onCreate()
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL, getString(R.string.channel_convert),
-                NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL, getString(R.string.channel_convert), NotificationManager.IMPORTANCE_LOW)
         )
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL_DONE, getString(R.string.channel_convert_done),
-                NotificationManager.IMPORTANCE_DEFAULT)
+            NotificationChannel(CHANNEL_DONE, getString(R.string.channel_convert_done), NotificationManager.IMPORTANCE_DEFAULT)
         )
     }
 
-    private fun note(text: String): Notification =
-        NotificationCompat.Builder(this, CHANNEL)
+    private fun note(text: String): Notification {
+        val bigStyle = NotificationCompat.BigTextStyle()
+        if (config.isEmpty()) {
+            bigStyle.bigText(text)
+        } else {
+            bigStyle.bigText(text + "\n" + config)
+        }
+
+        return NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle(
                 if (convertName.isEmpty()) getString(R.string.app_name)
                 else getString(R.string.converting_title, convertName)
             )
             .setContentText(text)
-            .setStyle(
-                NotificationCompat.BigTextStyle().bigText(
-                    if (config.isEmpty()) text else text + "\n" + config
-                )
-            )
+            .setStyle(bigStyle)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setContentIntent(PendingIntent.getActivity(
-                this, 0, Intent(this, MainActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            ))
-            .addAction(0, getString(R.string.stop_conversion), PendingIntent.getService(
-                this, 1, Intent(this, ConvertService::class.java).setAction(ACTION_STOP),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            ))
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this, 0, Intent(this, MainActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
+            .addAction(
+                0, getString(R.string.stop_conversion), PendingIntent.getService(
+                    this, 1, Intent(this, ConvertService::class.java).setAction(ACTION_STOP),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
             .setProgress(0, 0, true)
             .build()
+    }
 
     private var step = 0
     private var steps = 0
@@ -192,14 +186,15 @@ class ConvertService : Service() {
         while (logLines.size > 200) logLines.removeFirst()
         _state.value = State.Running(stage, detail, step, steps, logLines.toList(), startedAt, config)
         getSystemService(NotificationManager::class.java)
-            .notify(NOTE_ID, note(if (steps > 0) "$step/$steps$stage" else stage))
+            .notify(NOTE_ID, note(if (steps > 0) "$step/$steps  $stage" else stage))
     }
 
     private fun logLine(stage: String, line: String) {
         val t = line.trim()
         if (t.isEmpty()) return
         logLines.addLast(t)
-        val pct = PERCENT.findAll(t).lastOrNull()?.groupValues?.get(1)
+        val match = PERCENT.findAll(t).lastOrNull()
+        val pct = match?.groupValues?.get(1)
         if (pct != null) {
             post(stage, "$pct%")
             return
@@ -225,11 +220,11 @@ class ConvertService : Service() {
                             onProgress(name, "$pct%")
                         }
                     },
-                    onRetry = { onProgress(name, "retrying ($it)") },
+                    onRetry = { onProgress(name, "retrying ($it)") }
                 )
             } catch (e: java.io.IOException) {
                 throw Converter.Failure(
-                    "SDXL VAE download failed: ${e.message}. Progress is kept; retry, or import a VAE zip from the Utility tab.",
+                    "SDXL VAE download failed: ${e.message}. Progress is kept; retry, or import a VAE zip from the Utility tab."
                 )
             }
             if (!part.renameTo(cached)) throw Converter.Failure("could not store $name")
@@ -250,8 +245,7 @@ class ConvertService : Service() {
             config = ""
             val stage = getString(R.string.stage_vae_download)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(NOTE_ID, note(stage),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                startForeground(NOTE_ID, note(stage), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             } else {
                 startForeground(NOTE_ID, note(stage))
             }
@@ -268,7 +262,7 @@ class ConvertService : Service() {
                     wakeLock.acquire(WAKE_LOCK_LEASE.inWholeMilliseconds)
                     withContext(Dispatchers.IO) {
                         downloadSdxlVaeFiles { name, progress ->
-                            post(stage, "$name$progress".trim())
+                            post(stage, "$name $progress".trim())
                         }
                     }
                     _state.value = State.Idle
@@ -323,8 +317,7 @@ class ConvertService : Service() {
             (intent?.getStringArrayExtra(EXTRA_LORAS) ?: emptyArray()).mapNotNull { spec ->
                 val bar = spec.lastIndexOf('|')
                 if (bar <= 0) null
-                else spec.substring(0, bar).toUri() to
-                    (spec.substring(bar + 1).toFloatOrNull() ?: 1f)
+                else spec.substring(0, bar).toUri() to (spec.substring(bar + 1).toFloatOrNull() ?: 1f)
             }
         if (uri == null) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -357,13 +350,12 @@ class ConvertService : Service() {
             loraSpecs.size.takeIf { it > 0 }?.let { getString(R.string.config_loras_baked, it) },
             if (model.isSdxl) null else getString(R.string.config_clip_skip, clipSkip),
             if (requestedPredictionType == CheckpointInfo.PredictionType.V_PREDICTION) "V-pred" else null,
-            if (skipVaeEncoder && !model.isSdxl) "No-Enc" else null,
+            if (skipVaeEncoder && !model.isSdxl) "No-Enc" else null
         ).joinToString(" · ")
         getSystemService(NotificationManager::class.java).cancel(DONE_ID)
         val firstStage = getString(R.string.stage_import)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTE_ID, note(firstStage),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            startForeground(NOTE_ID, note(firstStage), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTE_ID, note(firstStage))
         }
@@ -417,17 +409,17 @@ class ConvertService : Service() {
                     post(getString(R.string.stage_validate))
                     if (model.isSdxl && Converter.socTier() == "8gen1") {
                         throw Converter.Failure(
-                            "SDXL needs Snapdragon 8 Gen 3 or newer. This phone (8 Gen 1) can convert SD1.5 models.",
+                            "SDXL needs Snapdragon 8 Gen 3 or newer. This phone (8 Gen 1) can convert SD1.5 models."
                         )
                     }
                     if (model == CheckpointInfo.Model.SD15_SWAP && loraSpecs.isNotEmpty()) {
                         throw Converter.Failure(
-                            "SD1.5 Swap does not bake LoRAs in; choose them per render in the generating app.",
+                            "SD1.5 Swap does not bake LoRAs in; choose them per render in the generating app."
                         )
                     }
                     if (model == CheckpointInfo.Model.SDXL_SWAP && loraSpecs.isNotEmpty()) {
                         throw Converter.Failure(
-                            "SDXL Swap does not bake LoRAs in; they will be chosen per render in the generating app.",
+                            "SDXL Swap does not bake LoRAs in; they will be chosen per render in the generating app."
                         )
                     }
                     val checkpointReport = CheckpointInfo.validate(
@@ -437,7 +429,7 @@ class ConvertService : Service() {
                             model == CheckpointInfo.Model.SDXL_SWAP -> CheckpointInfo.Model.SDXL
                             else -> model
                         },
-                        clipSkip,
+                        clipSkip
                     )
                     val predictionType = requestedPredictionType ?: checkpointReport.predictionType
                         ?: CheckpointInfo.PredictionType.EPSILON
@@ -445,7 +437,7 @@ class ConvertService : Service() {
                         "Prediction type=$predictionType " +
                             if (requestedPredictionType != null) "(explicit)"
                             else if (checkpointReport.predictionType != null) "(checkpoint metadata)"
-                            else "(default; metadata absent or unrecognised)",
+                            else "(default; metadata absent or unrecognised)"
                     )
 
                     val loraFiles = loraSpecs.mapIndexed { idx, (u, strength) ->
@@ -461,14 +453,14 @@ class ConvertService : Service() {
                     step++
                     post(getString(R.string.stage_clip))
                     Converter.stageClip(
-                        this@ConvertService, ckpt, work, componentFiles, model, diagnostic, clipDirectory,
+                        this@ConvertService, ckpt, work, componentFiles, model, diagnostic, clipDirectory
                     ) {
                         logLine(getString(R.string.stage_clip), it)
                     }
 
                     if (model.isSdxl) {
                         downloadSdxlVaeFiles { vaeName, progress ->
-                            post(getString(R.string.stage_vae_download), "$vaeName$progress".trim())
+                            post(getString(R.string.stage_vae_download), "$vaeName $progress".trim())
                         }
                         val vaeDir = File(filesDir, "vae_sdxl")
                         for (vaeName in listOf("vae_decoder.bin", "vae_encoder.bin")) {
@@ -487,12 +479,12 @@ class ConvertService : Service() {
                             post(getString(weightsStage))
                             val componentPack = Converter.stageWeights(
                                 this@ConvertService, ckpt, componentWork, model, diagnostic,
-                                templateDirectory = "${model.componentDirectory}/$component",
+                                templateDirectory = "${model.componentDirectory}/$component"
                             ) { logLine(getString(weightsStage), it) }
                             step++
                             post(getString(compileStage))
                             val output = Converter.stageCompile(
-                                this@ConvertService, componentPack, componentWork, model, diagnostic, component,
+                                this@ConvertService, componentPack, componentWork, model, diagnostic, component
                             ) { logLine(getString(compileStage), it) }
                             if (!output.renameTo(File(componentFiles, "$component.bin"))) {
                                 throw Converter.Failure("could not retain $component.bin")
@@ -515,7 +507,7 @@ class ConvertService : Service() {
                                 post(getString(R.string.stage_inpaint_diff_download), it)
                             }
                         }
-                        diagnostic.record("Inpaint difference: ${diff.name}${diff.length()} bytes")
+                        diagnostic.record("Inpaint difference: ${diff.name} ${diff.length()} bytes")
                         listOf("--inpaint-diff", diff.absolutePath) +
                             (if (swapInpaint) listOf("--input-channel-prefix") else emptyList())
                     } else emptyList()
@@ -525,7 +517,7 @@ class ConvertService : Service() {
                     val pack = Converter.stageWeights(
                         this@ConvertService, ckpt, work, model, diagnostic, loraFiles,
                         templateDirectory = templateDir,
-                        extraArgs = unetArgs,
+                        extraArgs = unetArgs
                     ) {
                         logLine(getString(R.string.stage_weights), it)
                     }
@@ -537,7 +529,7 @@ class ConvertService : Service() {
                     step++
                     post(getString(R.string.stage_compile))
                     val unet = Converter.stageCompile(
-                        this@ConvertService, pack, work, model, diagnostic, tplDrop = swapDrop,
+                        this@ConvertService, pack, work, model, diagnostic, tplDrop = swapDrop
                     ) {
                         logLine(getString(R.string.stage_compile), it)
                     }
@@ -547,14 +539,14 @@ class ConvertService : Service() {
                     post(getString(R.string.stage_assemble))
                     val where = Converter.assemble(
                         this@ConvertService, unet, name, model, componentFiles, swapFeatures = swapKept,
-                        predictionType = predictionType,
+                        predictionType = predictionType
                     ) { f ->
                         post(getString(R.string.stage_assemble), f)
                     }
 
                     result = State.Done(
                         where, (SystemClock.elapsedRealtime() - startedAt) / 1000,
-                        logLines.joinToString("\n"),
+                        logLines.joinToString("\n")
                     )
                 }
             } catch (e: CancellationException) {
@@ -615,11 +607,13 @@ class ConvertService : Service() {
             )
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_STATUS)
-            .setContentIntent(PendingIntent.getActivity(
-                this, 2, Intent(this, MainActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            ))
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this, 2, Intent(this, MainActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
             .build()
         runCatching { getSystemService(NotificationManager::class.java).notify(DONE_ID, n) }
     }
