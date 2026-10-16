@@ -85,7 +85,6 @@ class ConvertService : Service() {
          * add-difference. A plain string so `adb shell am --es` can drive it.
          */
         const val EXTRA_SWAP_FEATURES = "swap_features"
-        /** Optional toggle to force or skip compiling VAE encoder on mid-tier SoCs. */
         const val EXTRA_SKIP_VAE_ENCODER = "skip_vae_encoder"
 
         private val _state = MutableStateFlow<State>(State.Idle)
@@ -154,8 +153,11 @@ class ConvertService : Service() {
                 else getString(R.string.converting_title, convertName)
             )
             .setContentText(text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(
-                if (config.isEmpty()) text else "$text\n$config"))
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    if (config.isEmpty()) text else text + "\n" + config
+                )
+            )
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -330,11 +332,11 @@ class ConvertService : Service() {
             return START_NOT_STICKY
         }
 
-        // Auto-detect if device needs VAE Encoder skip (SM7750 / Snapdragon 7 Gen 4)
-        val isSubFlagshipSoC = Build.HARDWARE.contains("SM7750", ignoreCase = true) ||
-            Build.SOC_MODEL.contains("SM7750", ignoreCase = true) ||
-            Build.MODEL.contains("CPH2825", ignoreCase = true)
-        val skipVaeEncoder = intent?.getBooleanExtra(EXTRA_SKIP_VAE_ENCODER, isSubFlagshipSoC) ?: isSubFlagshipSoC
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL.uppercase() else ""
+        val isMidRangeSoC = soc.contains("SM7750") ||
+            Build.HARDWARE.contains("SM7750", ignoreCase = true) ||
+            Build.MODEL.contains("CPH2825", ignoreCase = true)[span_1](start_span)[span_1](end_span)
+        val skipVaeEncoder = intent?.getBooleanExtra(EXTRA_SKIP_VAE_ENCODER, isMidRangeSoC) ?: isMidRangeSoC
 
         convertName = name
         config = listOfNotNull(
