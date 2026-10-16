@@ -3,7 +3,6 @@ package com.abrah.npuforge
 import android.content.Context
 import android.net.Uri
 import android.os.Build
-import android.util.Log
 import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
@@ -184,17 +183,21 @@ object Converter {
         dst
     }
 
-    suspend fun stageDspLibs(context: Context, destination: File) = withContext(Dispatchers.IO) {
+    fun stageDspLibs(context: Context, destination: File = File(context.filesDir, "qnnlibs")): File {
         destination.mkdirs()
         runCatching {
             context.assets.list("qnnlibs")?.forEach { libName ->
-                context.assets.open("qnnlibs/$libName").use { input ->
-                    File(destination, libName).outputStream().use { output ->
-                        input.copyTo(output)
+                val outFile = File(destination, libName)
+                if (!outFile.exists() || outFile.length() == 0L) {
+                    context.assets.open("qnnlibs/$libName").use { input ->
+                        outFile.outputStream().use { output ->
+                            input.copyTo(output)
+                        }
                     }
                 }
             }
         }
+        return destination
     }
 
     suspend fun stageClip(
@@ -268,7 +271,7 @@ object Converter {
         onLog: (String) -> Unit
     ): File = withContext(Dispatchers.IO) {
         val nativeDir = context.applicationInfo.nativeLibraryDir
-        val qnnLibsDir = File(context.filesDir, "qnnlibs").absolutePath
+        val qnnLibsDir = stageDspLibs(context).absolutePath
         val htpConfig = File(workDir, "htp_backend.json").apply {
             writeText(buildHtpConfigJson("model"))
         }
